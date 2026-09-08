@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+  Jenkins writes this to <Project>/Saved/UnrealBuildTool/BuildConfiguration.xml
+  on every Shipping PGO/LTO job so agents cannot silently fall back to MSVC.
+  Pin CompilerVersion to the Clang 18.1.x actually installed on the agent.
+-->
+<Configuration xmlns="https://www.unrealengine.com/BuildConfiguration">
+  <WindowsPlatform>
+    <Compiler>Clang</Compiler>
+    <CompilerVersion>18.1.8</CompilerVersion>
+    <bAllowClangLinker>true</bAllowClangLinker>
+  </WindowsPlatform>
+  <BuildConfiguration>
+    <bAllowLTCG>true</bAllowLTCG>
+    <bPreferThinLTO>true</bPreferThinLTO>
+    <bUseIncrementalLinking>false</bUseIncrementalLinking>
+  </BuildConfiguration>
+</Configuration>
