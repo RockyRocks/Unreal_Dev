@@ -1,0 +1,245 @@
+// UE5 + Clang 18 Shipping pipeline: PGO instrument -> Gauntlet train ->
+// llvm-profdata merge -> PGO+ThinLTO optimize -> Sentry upload -> strip.
+//
+// Required Jenkins credentials:
+//   sentry-auth-token  — Sentry org token (project:releases + project:write)
+//
+// Required agent labels:
+//   ue5-win64-clang18  — LLVM 18.1.x, UE, sentry-cli
+//   ue5-pgo-train-gpu  — GPU node that can run the staged Shipping client
+//
+// Replace MyGame / engine paths before first run.
+
+pipeline {
+  agent none
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
+  parameters {
+    string(name: 'ENGINE_ROOT', defaultValue: 'C:\\UE5', description: 'Unreal Engine root on the compile agent')
+    string(name: 'PROJECT_NAME', defaultValue: 'MyGame', description: 'UProject name without extension')
+    choice(name: 'PLATFORM', choices: ['Win64', 'Linux'], description: 'UBT platform')
+    booleanParam(name: 'RETRAIN_PGO', defaultValue: true, description: 'If false, reuse last archived profdata')
+    string(name: 'CLANG_VERSION', defaultValue: '18.1.8', description: 'Must match the agent toolchain')
+  }
+
+  environment {
+    CLIENT_CONFIG = 'Shipping'
+    SENTRY_ORG    = 'your-org'
+    SENTRY_PROJECT = 'your-project'
+  }
+
+  stages {
+    stage('Toolchain assert') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        script {
+          if (isUnix()) {
+            sh '''
+              set -e
+              clang-18 --version | head -n 1
+              llvm-profdata-18 --version
+              which ld.lld
+            '''
+          } else {
+            bat '''
+              clang --version
+              llvm-profdata --version
+              where lld-link
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Phase A — instrumented Shipping') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        lock(resource: 'ue5-thinlto-linker', inversePrecedence: true) {
+          script {
+            env.GAME_SHA = isUnix() ? sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                                    : bat(script: '@git rev-parse --short HEAD', returnStdout: true).trim()
+            env.SENTRY_RELEASE = "${params.PROJECT_NAME}@${env.GAME_SHA}"
+            env.UE_PGO_DIR = "${env.WORKSPACE}/PGO/clang18/${env.GAME_SHA}"
+            env.UE_THINLTO_CACHE = "${env.WORKSPACE}/ThinLTOCache/${params.CLANG_VERSION}"
+          }
+          writeFile file: 'Saved/UnrealBuildTool/BuildConfiguration.xml',
+                    text: readFile('docs/pipelines/templates/BuildConfiguration.xml')
+          script {
+            def uat = "${params.ENGINE_ROOT}\\Engine\\Build\\BatchFiles\\RunUAT.bat"
+            if (isUnix()) {
+              uat = "${params.ENGINE_ROOT}/Engine/Build/BatchFiles/RunUAT.sh"
+            }
+            def ubt = '-LTCG -ThinLTO -PGOProfile -ClangLinker -noUBA'
+            if (isUnix()) {
+              sh """
+                export UE_PGO_DIR='${env.UE_PGO_DIR}'
+                export UE_THINLTO_CACHE='${env.UE_THINLTO_CACHE}'
+                mkdir -p "\$UE_PGO_DIR/raw"
+                '${uat}' BuildCookRun \
+                  -project='${env.WORKSPACE}/${params.PROJECT_NAME}.uproject' \
+                  -platform=${params.PLATFORM} -clientconfig=${env.CLIENT_CONFIG} \
+                  -build -cook -stage -pak -prereqs \
+                  -ubtargs='${ubt}' -utf8output
+              """
+            } else {
+              bat """
+                set UE_PGO_DIR=${env.UE_PGO_DIR}
+                set UE_THINLTO_CACHE=${env.UE_THINLTO_CACHE}
+                mkdir "%UE_PGO_DIR%\\raw" 2>nul
+                ${uat} BuildCookRun ^
+                  -project="%WORKSPACE%\\${params.PROJECT_NAME}.uproject" ^
+                  -platform=${params.PLATFORM} -clientconfig=${env.CLIENT_CONFIG} ^
+                  -build -cook -stage -pak -prereqs ^
+                  -ubtargs="${ubt}" -utf8output
+              """
+            }
+          }
+          stash name: 'instrumented', includes: 'Saved/StagedBuilds/**'
+        }
+      }
+    }
+
+    stage('Gauntlet PGO train') {
+      when { expression { return params.RETRAIN_PGO } }
+      agent { label 'ue5-pgo-train-gpu' }
+      steps {
+        unstash 'instrumented'
+        script {
+          def uat = "${params.ENGINE_ROOT}\\Engine\\Build\\BatchFiles\\RunUAT.bat"
+          if (isUnix()) {
+            sh """
+              export LLVM_PROFILE_FILE='${env.UE_PGO_DIR}/raw/%p_%m.profraw'
+              export UE_PGO_DIR='${env.UE_PGO_DIR}'
+              '${params.ENGINE_ROOT}/Engine/Build/BatchFiles/RunUAT.sh' RunUnreal \
+                -project='${env.WORKSPACE}/${params.PROJECT_NAME}.uproject' \
+                -platform=${params.PLATFORM} -configuration=${env.CLIENT_CONFIG} \
+                -build=local \
+                -ClientExecCmds='Automation RunTests Filter:PGOTraining;Quit'
+            """
+          } else {
+            bat """
+              set LLVM_PROFILE_FILE=${env.UE_PGO_DIR}\\raw\\%p_%m.profraw
+              set UE_PGO_DIR=${env.UE_PGO_DIR}
+              ${uat} RunUnreal ^
+                -project="%WORKSPACE%\\${params.PROJECT_NAME}.uproject" ^
+                -platform=${params.PLATFORM} -configuration=${env.CLIENT_CONFIG} ^
+                -build=local ^
+                -ClientExecCmds="Automation RunTests Filter:PGOTraining;Quit"
+            """
+          }
+        }
+        stash name: 'profraw', includes: 'PGO/**/*.profraw'
+      }
+    }
+
+    stage('Merge profdata') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        unstash 'profraw'
+        dir('docs/pipelines/templates') {
+          script {
+            if (isUnix()) {
+              sh 'chmod +x merge-profdata.sh && ./merge-profdata.sh'
+            } else {
+              bat 'bash merge-profdata.sh'
+            }
+          }
+        }
+        archiveArtifacts artifacts: 'PGO/**/default.profdata', fingerprint: true
+        stash name: 'profdata', includes: 'PGO/**/default.profdata'
+      }
+    }
+
+    stage('Phase B — PGO + ThinLTO optimize') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        lock(resource: 'ue5-thinlto-linker', inversePrecedence: true) {
+          unstash 'profdata'
+          script {
+            if (isUnix()) {
+              sh """
+                rm -rf Binaries Intermediate/Build
+                export UE_PGO_DIR='${env.UE_PGO_DIR}'
+                export UE_THINLTO_CACHE='${env.UE_THINLTO_CACHE}'
+                '${params.ENGINE_ROOT}/Engine/Build/BatchFiles/RunUAT.sh' BuildCookRun \
+                  -project='${env.WORKSPACE}/${params.PROJECT_NAME}.uproject' \
+                  -platform=${params.PLATFORM} -clientconfig=${env.CLIENT_CONFIG} \
+                  -build -cook -stage -pak -prereqs \
+                  -archive -archivedirectory='${env.WORKSPACE}/Dist' \
+                  -ubtargs='-LTCG -ThinLTO -PGOOptimize -ClangLinker -noUBA' \
+                  -utf8output
+              """
+            } else {
+              bat """
+                rmdir /s /q Binaries 2>nul
+                rmdir /s /q Intermediate\\Build 2>nul
+                set UE_PGO_DIR=${env.UE_PGO_DIR}
+                set UE_THINLTO_CACHE=${env.UE_THINLTO_CACHE}
+                ${params.ENGINE_ROOT}\\Engine\\Build\\BatchFiles\\RunUAT.bat BuildCookRun ^
+                  -project="%WORKSPACE%\\${params.PROJECT_NAME}.uproject" ^
+                  -platform=${params.PLATFORM} -clientconfig=${env.CLIENT_CONFIG} ^
+                  -build -cook -stage -pak -prereqs ^
+                  -archive -archivedirectory="%WORKSPACE%\\Dist" ^
+                  -ubtargs="-LTCG -ThinLTO -PGOOptimize -ClangLinker -noUBA" ^
+                  -utf8output
+              """
+            }
+          }
+        }
+      }
+    }
+
+    stage('Sentry symbols then strip') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        withCredentials([string(credentialsId: 'sentry-auth-token', variable: 'SENTRY_AUTH_TOKEN')]) {
+          script {
+            if (isUnix()) {
+              sh '''
+                set -e
+                mkdir -p symbols
+                # Adjust glob to your staged binary name.
+                cp -v Dist/**/MyGame* symbols/ || cp -v Binaries/**/MyGame* symbols/
+                chmod +x docs/pipelines/templates/upload-sentry-symbols.sh
+                chmod +x docs/pipelines/templates/strip-shipping.sh
+                docs/pipelines/templates/upload-sentry-symbols.sh symbols
+                for f in Dist/**/MyGame Dist/**/MyGame-*-Shipping; do
+                  [ -f "$f" ] && docs/pipelines/templates/strip-shipping.sh "$f" || true
+                done
+              '''
+            } else {
+              bat '''
+                mkdir symbols 2>nul
+                xcopy /y /s Dist\\*MyGame*.exe symbols\\
+                xcopy /y /s Dist\\*MyGame*.pdb symbols\\
+                bash docs/pipelines/templates/upload-sentry-symbols.sh symbols
+                bash docs/pipelines/templates/strip-shipping.sh Dist\\Windows\\MyGame.exe
+              '''
+            }
+          }
+        }
+      }
+    }
+
+    stage('Archive store drop') {
+      agent { label 'ue5-win64-clang18' }
+      steps {
+        archiveArtifacts artifacts: 'Dist/**', fingerprint: true, allowEmptyArchive: false
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Shipping ${env.SENTRY_RELEASE} published. Confirm symbolication on Sentry before promoting the Dist drop."
+    }
+    failure {
+      echo 'Inspect Phase A logs for Clang/LLD, Gauntlet for profraw, Phase B for -fprofile-use, Sentry for debug-id mismatch.'
+    }
+  }
+}
